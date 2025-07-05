@@ -779,80 +779,20 @@ class CleanGSNRCalculator:
 
     def _calculate_icxt(self, path_links: List, channel_index: int, core_index: int, 
                    spectrum_allocation=None, launch_power_dbm: float = 0.0) -> Dict:
-    
-        # if self._icxt_call_count[call_key] == 1:
-        #     is_single_span = len(path_links) == 1 and path_links[0].num_spans == 1
-        #     calculation_type = "SPAN-WISE" if is_single_span else "PATH-WISE (ERROR!)"
-        #     print(f"\n🔍 ICXT Debug - Channel {channel_index}, Core {core_index} [{calculation_type}]:")
-        #     print(f"   Length: {L/1000:.1f} km, Links: {len(path_links)}")
+        """
+        Calculate ICXT using correct span-wise approach with link-wise NAC detection
         
-        #print(f"🔍 ICXT DEBUG CALLED - Ch{channel_index}, Core{core_index}")
-        trench_params = self.config.mcf_params.get_trench_parameters_for_icxt()
-        r_1 = trench_params['r_1_m']
-        Lambda = trench_params['Lambda_m'] 
-        w_tr = trench_params['w_tr_m']
-        r_b = trench_params['r_b_m']
-        n_core = trench_params['n_core']
-        Delta_1 = trench_params['Delta_1']
+        Args:
+            path_links: Should contain single span info with link_id preserved
+            channel_index: Target channel index  
+            core_index: Target core index
+            spectrum_allocation: Current spectrum allocation matrix
+            launch_power_dbm: Launch power in dBm
+            
+        Returns:
+            Dict with ICXT calculation results
+        """
         
-        L = sum(link.length_km for link in path_links) * 1000
-        f_i = self.frequencies_hz[channel_index]
-        
-        # Calculate V₁, W₁, U₁², K₁, Γ, κ, Ω, NAC, μ_ICXT
-        V_1 = (2 * np.pi * f_i * r_1 * n_core * np.sqrt(2 * Delta_1)) / self.c_light
-        W_1 = max(0.1, 1.143 * V_1 - 0.22)
-        U_1_squared = ((2 * np.pi * f_i * r_1 * n_core) / self.c_light)**2 * (2 * Delta_1)
-        K_1 = np.sqrt(np.pi / (2 * W_1)) * np.exp(-W_1)
-        
-        Gamma = W_1 / (W_1 + 1.2 * (1 + V_1) * (w_tr / Lambda))
-        
-        sqrt_Gamma = np.sqrt(max(Gamma, 1e-10))
-        ratio_term = U_1_squared / (V_1**3 * K_1**2)
-        geometric_term = np.sqrt(np.pi * r_1) / (W_1 * Lambda)
-        exponent = -(W_1 * Lambda + 1.2 * (1 + V_1) * w_tr) / r_1
-        exp_term = np.exp(exponent)
-        
-        kappa = sqrt_Gamma * ratio_term * geometric_term * exp_term
-        Omega = (self.c_light * kappa**2 * r_b * n_core) / (np.pi * f_i * Lambda)
-        
-        # Get active adjacent cores
-        adjacent_cores = self._get_adjacent_cores(core_index, self.config.mcf_params.num_cores)
-        #print(f"   Adjacent cores to Core {core_index}: {adjacent_cores}")
-        NAC = 0
-        if spectrum_allocation:
-            for adj_core in adjacent_cores:
-                for link in path_links:
-                    if spectrum_allocation.allocation[link.link_id, adj_core, channel_index] > 0:
-                        NAC += 1
-                        break
-        else:
-            NAC = len(adjacent_cores) // 2
-        
-        # Calculate μ_ICXT using Equation 1
-        if NAC > 0:
-            exp_arg = -(NAC + 1) * Omega * L
-            if exp_arg < -50:
-                exp_term = 0.0
-            else:
-                exp_term = np.exp(exp_arg)
-            mu_icxt = (NAC - NAC * exp_term) / (1 + NAC * exp_term)
-        else:
-            mu_icxt = 0.0
-        
-        launch_power_w = 10**(launch_power_dbm/10) * 1e-3
-        icxt_power_w = mu_icxt * launch_power_w
-        
-        return {
-            'icxt_power_w': max(0, icxt_power_w),
-            'mu_icxt': mu_icxt,
-            'omega': Omega,
-            'kappa': kappa,
-            'NAC': NAC
-        }
-    
-    def _calculate_icxt_(self, path_links: List, channel_index: int, core_index: int, 
-                   spectrum_allocation=None, launch_power_dbm: float = 0.0) -> Dict:
-    
         # Add call counter to prevent spam
         if not hasattr(self, '_icxt_call_count'):
             self._icxt_call_count = {}
@@ -863,118 +803,212 @@ class CleanGSNRCalculator:
         
         self._icxt_call_count[call_key] += 1
         
-        # Only show debug for first call
+        # Validate input - should be single span
+        if len(path_links) != 1:
+            if self._icxt_call_count[call_key] == 1:
+                print(f"⚠️ ERROR: ICXT should be called per span, got {len(path_links)} links")
+            return {
+                'icxt_power_w': 0.0,
+                'mu_icxt': 0.0,
+                'omega': 0.0,
+                'kappa': 0.0,
+                'NAC': 0
+            }
+        
+        span_info = path_links[0]
+        target_link_id = span_info.link_id  # Which link this span belongs to
+        span_length_km = span_info.length_km
+        
+        # Show debug info only on first call
         if self._icxt_call_count[call_key] == 1:
-            print(f"\n🔍 ICXT Debug - Channel {channel_index}, Core {core_index}:")
+            print(f"\n🔍 ICXT Debug - Channel {channel_index}, Core {core_index} [SPAN-WISE]:")
+            print(f"   Span: {span_length_km:.1f} km on Link {target_link_id}")
         elif self._icxt_call_count[call_key] <= 5:
             print(f"   🔍 ICXT call #{self._icxt_call_count[call_key]} for Ch{channel_index}, Core{core_index}")
         elif self._icxt_call_count[call_key] == 6:
-            print(f"   ⚠️  ICXT called {self._icxt_call_count[call_key]}+ times for Ch{channel_index}, Core{core_index} - suppressing further debug")
+            print(f"   ⚠️  ICXT called {self._icxt_call_count[call_key]}+ times - suppressing debug")
         
-        # Your existing ICXT calculation code...
-        trench_params = self.config.mcf_params.get_trench_parameters_for_icxt()
-        r_1 = trench_params['r_1_m']
-        Lambda = trench_params['Lambda_m'] 
-        w_tr = trench_params['w_tr_m']
-        r_b = trench_params['r_b_m']
-        n_core = trench_params['n_core']
-        Delta_1 = trench_params['Delta_1']
+        # Get trench parameters from config
+        try:
+            trench_params = self.config.mcf_params.get_trench_parameters_for_icxt()
+        except AttributeError:
+            if self._icxt_call_count[call_key] == 1:
+                print("   ⚠️ Enhanced trench parameters not available - using fallback")
+            return self._calculate_icxt_fallback_single_span(span_info, channel_index, core_index, 
+                                                            spectrum_allocation, launch_power_dbm)
         
-        L = sum(link.length_km for link in path_links) * 1000
+        # Extract physical parameters
+        r_1 = trench_params['r_1_m']           # Core radius (m)
+        Lambda = trench_params['Lambda_m']      # Core pitch (m)
+        w_tr = trench_params['w_tr_m']         # Trench width (m)
+        r_b = trench_params['r_b_m']           # Bending radius (m)
+        n_core = trench_params['n_core']       # Core refractive index
+        Delta_1 = trench_params['Delta_1']     # Core-cladding delta
+        
+        # Span length in meters
+        L = span_length_km * 1000
+        
+        # Channel frequency
         f_i = self.frequencies_hz[channel_index]
         
-        # Only show detailed debug on first call
         if self._icxt_call_count[call_key] == 1:
-            print(f"   Path length: {L/1000:.1f} km, Frequency: {f_i/1e12:.2f} THz")
+            print(f"   Frequency: {f_i/1e12:.2f} THz")
         
-        # Calculate V₁, W₁, U₁², K₁, Γ, κ, Ω, NAC, μ_ICXT
+        # STEP 1: Calculate V₁(fᵢ) - Normalized frequency
         V_1 = (2 * np.pi * f_i * r_1 * n_core * np.sqrt(2 * Delta_1)) / self.c_light
+        
+        # STEP 2: Calculate W₁ - Normalized decay constant  
         W_1 = max(0.1, 1.143 * V_1 - 0.22)
+        
+        # STEP 3: Calculate U₁²(fᵢ) - Squared transverse propagation constant
         U_1_squared = ((2 * np.pi * f_i * r_1 * n_core) / self.c_light)**2 * (2 * Delta_1)
+        
+        # STEP 4: Calculate K₁(W₁) - Modified Bessel function approximation
         K_1 = np.sqrt(np.pi / (2 * W_1)) * np.exp(-W_1)
         
+        # STEP 5: Calculate Γ - Trench correction factor
         Gamma = W_1 / (W_1 + 1.2 * (1 + V_1) * (w_tr / Lambda))
+        Gamma = max(0.1, min(1.0, Gamma))  # Ensure reasonable bounds
         
+        # STEP 6: Calculate κ(fᵢ) - Mode Coupling Coefficient (Equation 3)
         sqrt_Gamma = np.sqrt(max(Gamma, 1e-10))
         ratio_term = U_1_squared / (V_1**3 * K_1**2)
         geometric_term = np.sqrt(np.pi * r_1) / (W_1 * Lambda)
+        
+        # Exponential term with trench contribution
         exponent = -(W_1 * Lambda + 1.2 * (1 + V_1) * w_tr) / r_1
-        exp_term = np.exp(exponent)
+        if exponent < -50:
+            exp_term = 0.0
+        else:
+            exp_term = np.exp(exponent)
         
         kappa = sqrt_Gamma * ratio_term * geometric_term * exp_term
-        Omega = (self.c_light * kappa**2 * r_b * n_core) / (np.pi * f_i * Lambda)
+        kappa = max(kappa, 1e-15)
         
-        # Get active adjacent cores - THIS IS THE KEY PART TO DEBUG
+        # STEP 7: Calculate Ω(fᵢ) - Power Coupling Coefficient (Equation 2)
+        if f_i <= 0 or Lambda <= 0:
+            Omega = 1e-15
+        else:
+            Omega = (self.c_light * kappa**2 * r_b * n_core) / (np.pi * f_i * Lambda)
+            Omega = max(Omega, 1e-15)
+        
+        # STEP 8: Calculate NAC - Link-wise Adjacent Core Detection
         adjacent_cores = self._get_adjacent_cores(core_index, self.config.mcf_params.num_cores)
-        
         NAC = 0
-        if spectrum_allocation and self._icxt_call_count[call_key] == 1:
-            print(f"   Adjacent cores to Core {core_index}: {adjacent_cores}")
-            print(f"   Checking interference from adjacent cores:")
+        
+        if spectrum_allocation:
+            if self._icxt_call_count[call_key] == 1:
+                print(f"   Adjacent cores to Core {core_index}: {adjacent_cores}")
+                print(f"   Link-wise interference check for Link {target_link_id}:")
             
             for adj_core in adjacent_cores:
-                is_active = False
-                active_links = []
+                # Check if adjacent core is active on THIS SAME LINK
+                is_active = spectrum_allocation.allocation[target_link_id, adj_core, channel_index] > 0
                 
-                # Check ALL links in network, not just path links
-                for link_id in range(spectrum_allocation.num_links):
-                    if spectrum_allocation.allocation[link_id, adj_core, channel_index] > 0:
-                        active_links.append(link_id)
-                        is_active = True
-                
-                print(f"      Core {adj_core}: {'ACTIVE' if is_active else 'INACTIVE'} on links {active_links}")
+                if self._icxt_call_count[call_key] == 1:
+                    conn_id = spectrum_allocation.allocation[target_link_id, adj_core, channel_index]
+                    status = f"ACTIVE (conn {conn_id})" if is_active else "INACTIVE"
+                    print(f"      Core {adj_core}: {status}")
                 
                 if is_active:
                     NAC += 1
-        elif spectrum_allocation:
-            # Don't debug, just calculate NAC
-            for adj_core in adjacent_cores:
-                for link_id in range(spectrum_allocation.num_links):
-                    if spectrum_allocation.allocation[link_id, adj_core, channel_index] > 0:
-                        NAC += 1
-                        break
         else:
+            # Fallback: conservative estimate
             NAC = len(adjacent_cores) // 2
+            if self._icxt_call_count[call_key] == 1:
+                print(f"   No spectrum allocation - using fallback NAC: {NAC}")
         
-        # Calculate μ_ICXT using Equation 1
+        if self._icxt_call_count[call_key] == 1:
+            print(f"   Link-wise NAC: {NAC}")
+        
+        # STEP 9: Calculate μ_ICXT(fᵢ) - Inter-Core Crosstalk (Equation 1)
         if NAC > 0:
             exp_arg = -(NAC + 1) * Omega * L
-            if exp_arg < -50:
+            
+            if self._icxt_call_count[call_key] == 1:
+                print(f"   Exponential argument: {exp_arg:.2f}")
+            
+            # Numerical stability for large arguments
+            if exp_arg < -50:  # exp(-50) ≈ 2e-22
                 exp_term = 0.0
+            elif exp_arg > 50:   # exp(50) ≈ 5e21
+                exp_term = np.inf
             else:
                 exp_term = np.exp(exp_arg)
-            mu_icxt = (NAC - NAC * exp_term) / (1 + NAC * exp_term)
+            
+            # Handle edge cases
+            if exp_term == 0.0:
+                # Long fiber or strong coupling: μ_ICXT approaches saturation
+                mu_icxt = min(1.0, NAC / (NAC + 1))
+            elif np.isinf(exp_term):
+                # Very short fiber or weak coupling: μ_ICXT → 0
+                mu_icxt = 0.0
+            else:
+                # Normal case: apply Equation 1
+                numerator = NAC - NAC * exp_term
+                denominator = 1 + NAC * exp_term
+                
+                if denominator <= 0:
+                    mu_icxt = 0.0
+                else:
+                    mu_icxt = numerator / denominator
+            
+            # Ensure physical bounds: 0 ≤ μ_ICXT ≤ 1
+            mu_icxt = max(0.0, min(1.0, mu_icxt))
+            
         else:
             mu_icxt = 0.0
+            if self._icxt_call_count[call_key] == 1:
+                print(f"   No adjacent interference - μ_ICXT: 0")
         
+        # STEP 10: Calculate ICXT power
         launch_power_w = 10**(launch_power_dbm/10) * 1e-3
         icxt_power_w = mu_icxt * launch_power_w
         
-        # Only show results on first call
+        # Show results on first call
         if self._icxt_call_count[call_key] == 1:
-            print(f"   NAC: {NAC}, μ_ICXT: {mu_icxt:.2e}, ICXT Power: {icxt_power_w:.2e} W")
+            print(f"   κ: {kappa:.2e}, Ω: {Omega:.2e}")
+            print(f"   μ_ICXT: {mu_icxt:.2e}, ICXT Power: {icxt_power_w:.2e} W")
+            if icxt_power_w > 1e-15:
+                icxt_dbm = 10 * np.log10(icxt_power_w * 1000)
+                print(f"   ICXT Power: {icxt_dbm:.1f} dBm")
         
         return {
             'icxt_power_w': max(0, icxt_power_w),
             'mu_icxt': mu_icxt,
             'omega': Omega,
             'kappa': kappa,
-            'NAC': NAC
+            'NAC': NAC,
+            'V_1': V_1,
+            'W_1': W_1,
+            'U_1_squared': U_1_squared,
+            'K_1': K_1,
+            'Gamma': Gamma,
+            'span_length_km': span_length_km,
+            'target_link_id': target_link_id
         }
-
+    
+  
     def _get_adjacent_cores(self, core_index: int, num_cores: int) -> List[int]:
-        """Get adjacent cores for given core in 4-core square layout"""
+        """Get adjacent cores for given core layout"""
         if num_cores == 4:
             # 4-core square layout: 0-1, 0-3, 1-2, 2-3
             adjacency = {0: [1, 3], 1: [0, 2], 2: [1, 3], 3: [0, 2]}
             return adjacency.get(core_index, [])
+        elif num_cores == 7:
+            # 7-core hexagonal layout
+            if core_index == 0:  # Center core
+                return [1, 2, 3, 4, 5, 6]  # Adjacent to all outer cores
+            else:  # Outer cores
+                # Each outer core adjacent to center + 2 neighbors
+                return [0, ((core_index - 1) % 6) + 1, (core_index % 6) + 1]
         else:
-            # Generic: adjacent cores (simplified)
+            # Generic: assume all other cores are adjacent (conservative)
             adjacent = []
             for i in range(num_cores):
                 if i != core_index:
                     adjacent.append(i)
-            return adjacent[:6]  # Limit to 6 adjacent cores max
+            return adjacent[:6]  # Limit to 6 for reasonable computation
 
 
     def _aggregate_gsnr_pathwise(self, step1_result: Dict, step3_result: Dict, step7_result: Dict,
